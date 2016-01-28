@@ -6,11 +6,6 @@
 
 APPNAME		= gpio-event
 
-OVEROTOP	?= /home/gumstix/overo-oe
-CROSS_COMPILE	?= $(OVEROTOP)/tmp/cross/armv7a/bin/arm-angstrom-linux-gnueabi-
-
-CC		= $(CROSS_COMPILE)gcc
-
 CFLAGS += \
 	-std=gnu99 \
 	-Wall \
