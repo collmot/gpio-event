@@ -189,6 +189,7 @@ static  volatile    int     gReportLostEvents = 1;
 static  struct class       *gGpioEventClass = NULL;
 static  struct  cdev        gGpioEventCDev;
 static  dev_t               gGpioEventDevNum = 0;
+static  struct device      *gGpioEventDevice = NULL;
 
 static  DEFINE_SPINLOCK( gFileListLock );
 static  DEFINE_SPINLOCK( gPinListLock );
@@ -1094,6 +1095,21 @@ struct file_operations gpio_event_fops =
 
 /****************************************************************************
 *
+*   Attribute group for GPIO event counters in sysfs
+*
+****************************************************************************/
+
+static struct attribute *gpio_event_counters_group_attrs[] = {
+    NULL
+};
+
+static struct attribute_group gpio_event_counters_group = {
+    .name  = "counters",
+    .attrs = gpio_event_counters_group_attrs
+};
+
+/****************************************************************************
+*
 *  gpio_event_init
 *
 *     Called to perform module initialization when the module is loaded
@@ -1112,7 +1128,7 @@ static int __init gpio_event_init( void )
 
     if (( rc = alloc_chrdev_region( &gGpioEventDevNum, 0, 1, GPIO_EVENT_DEV_NAME )) < 0 )
     {
-        printk( KERN_WARNING "sample: Unable to allocate major, err: %d\n", rc );
+        printk( KERN_WARNING "gpio-event-drv: Unable to allocate major, err: %d\n", rc );
         return rc;
     }
     DEBUG( Trace, "allocated major:%d minor:%d\n", MAJOR( gGpioEventDevNum ), MINOR( gGpioEventDevNum ));
@@ -1148,7 +1164,7 @@ static int __init gpio_event_init( void )
 
     if (( rc = cdev_add( &gGpioEventCDev, gGpioEventDevNum, 1 )) != 0 )
     {
-        printk( KERN_WARNING "sample: cdev_add failed: %d\n", rc );
+        printk( KERN_WARNING "gpio-event-drv: cdev_add failed: %d\n", rc );
         return rc;
     }
 
@@ -1157,12 +1173,25 @@ static int __init gpio_event_init( void )
     gGpioEventClass = class_create( THIS_MODULE, GPIO_EVENT_DEV_NAME );
     if ( IS_ERR( gGpioEventClass ))
     {
-        printk( KERN_WARNING "sample: Unable to create class\n" );
+        printk( KERN_WARNING "gpio-event-drv: Unable to create class\n" );
         return -1;
     }
 
-    device_create( gGpioEventClass, NULL, gGpioEventDevNum, NULL, GPIO_EVENT_DEV_NAME );
+    gGpioEventDevice = device_create( gGpioEventClass, NULL, gGpioEventDevNum, NULL, GPIO_EVENT_DEV_NAME );
+    if ( IS_ERR( gGpioEventDevice ))
+    {
+        printk( KERN_WARNING "gpio-event-drv: Unable to create device\n" );
+        return -1;
+    }
 
+    // Create the counters group within the device kobject
+    
+    if ((rc = sysfs_create_group( &gGpioEventDevice->kobj, &gpio_event_counters_group )) != 0 )
+    {
+        printk( KERN_WARNING "gpio-event-drv: Unable to create counters group within kobject\n" );
+        return -1;
+    }
+    
     return 0;
 
 } // gpio_event_init
@@ -1201,6 +1230,7 @@ static void __exit gpio_event_exit( void )
 
     device_destroy( gGpioEventClass, gGpioEventDevNum );
     class_destroy( gGpioEventClass );
+    gGpioEventDevice = NULL;
 
     cdev_del( &gGpioEventCDev );
 
