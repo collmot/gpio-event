@@ -860,7 +860,17 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
 
     (void)irq;
 
-    do_gettimeofday( &gpioEvent.time );
+    if ( pinData->monitoringMode & GPIO_GenerateEvents )
+    { 
+        // Query the current time and store it in the event
+        do_gettimeofday( &gpioEvent.time );
+    }
+    else
+    {
+        // We don't need the current time -- we won't use gpioEvent anyway
+        gpioEvent.time = 0;
+    }
+    
     gpioEvent.gpio = pinData->gpio;
 
     if ( pinData->debounceMilliSec == 0 )
