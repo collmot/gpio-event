@@ -278,7 +278,10 @@ int main( int argc, char **argv )
         else
         {
             monitor.gpio = gpio;
-            monitor.onOff = 1;
+            monitor.onOff =
+                ( gMonitor ? GPIO_GenerateEvents : 0 ) |
+                ( gCount ? GPIO_UpdateCounters : 0 )
+            ;
         }
 
         if ( monitor.gpio > 255 )

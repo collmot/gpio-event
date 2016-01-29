@@ -184,9 +184,11 @@ typedef struct
     uint8_t                 debounceMilliSec;   // debounce time in milliseconds
     char                    devName[ 16 ];      // gpio xx event
 
-    GPIO_EventEdgeType_t    edgeType;   // Type of edge(s) we're looking for.
+    GPIO_EventEdgeType_t    edgeType;           // Type of edge(s) we're looking for.
 
-    PinState_t              pinState;          // Was the GPIO line low or high?
+    PinState_t              pinState;           // Was the GPIO line low or high?
+
+    GPIO_MonitoringMode_t   monitoringMode;     // Whether to count or generate events (or both)
 
 } GPIO_PinData_t;
 
@@ -302,6 +304,7 @@ static int pin_seq_show( struct seq_file *s, void *v )
 {
     GPIO_PinData_t *pin = list_entry( v, GPIO_PinData_t, list );
     char           *edgeTypeStr;
+    char           *modeStr;
 
     DEBUG( Trace, "v = 0x%08lx\n", (long)v );
 
@@ -313,7 +316,31 @@ static int pin_seq_show( struct seq_file *s, void *v )
         default:                    edgeTypeStr = "Unknown";    break;
     }
 
-    seq_printf( s, "GPIO: %3d Edge: %s Debounce: %d msec\n", pin->gpio, edgeTypeStr, pin->debounceMilliSec );
+    if ( pin->monitoringMode & GPIO_GenerateEvents )
+    {
+        if ( pin->monitoringMode & GPIO_UpdateCounters )
+        {
+            modeStr = "Count and generate events";
+        }
+        else
+        {
+            modeStr = "Generate events";
+        }
+    }
+    else
+    {
+        if ( pin->monitoringMode & GPIO_UpdateCounters )
+        {
+            modeStr = "Count events";
+        }
+        else
+        {
+            modeStr = "Off";
+        }
+    }
+
+    seq_printf( s, "GPIO: %3d Edge: %s Debounce: %d msec Mode: %s\n",
+        pin->gpio, edgeTypeStr, pin->debounceMilliSec, modeStr );
 
     return 0;
 
@@ -631,6 +658,10 @@ static void gpio_event_counters_remove_attribute( GPIO_Counters_t* counters, int
             continue;
         }
 
+        // Remove the attribute from sysfs
+
+        sysfs_remove_file( counters->kobj, &attr_data->kattr.attr );
+        
 	// Free the memory we have allocated for the name
 
         if (attr_data->kattr.attr.name != 0)
@@ -865,12 +896,16 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
         }
 
         // Send the event to the user
-         
-        gpio_event_queue_event( &gpioEvent );
+        if ( pinData->monitoringMode & GPIO_GenerateEvents )
+        { 
+            gpio_event_queue_event( &gpioEvent );
+        }
 
         // Also increase the event counter
-        
-        gpio_event_counter_increase( pinData->gpio, 1 ); 
+        if ( pinData->monitoringMode & GPIO_UpdateCounters )
+        {
+            gpio_event_counter_increase( pinData->gpio, 1 ); 
+        }
     }
     else
     {
@@ -906,12 +941,16 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
         if (( pinData->edgeType & gpioEvent.edgeType ) != 0 )
         {
             // This is an edge that the user is interested in - send it along.
-
-            gpio_event_queue_event( &gpioEvent );
+            if ( pinData->monitoringMode & GPIO_GenerateEvents )
+            {
+                gpio_event_queue_event( &gpioEvent );
+            }
 
             // Also increase the event counter
-            
-            gpio_event_counter_increase( pinData->gpio, 1 ); 
+            if ( pinData->monitoringMode & GPIO_UpdateCounters )
+            {
+                gpio_event_counter_increase( pinData->gpio, 1 ); 
+            }
         }
 
         // Disable interrupts for our gpio to allow debounce to occur. The
@@ -960,11 +999,12 @@ void gpio_event_timer( unsigned long data )
 
 static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
 {
-    int             rc = 0;
-    unsigned long   flags;
-    GPIO_PinData_t *pinData;
-    GPIO_PinData_t *allocPinData = NULL;
-    unsigned long   irqFlags;
+    int                    rc = 0;
+    unsigned long          flags;
+    GPIO_PinData_t        *pinData;
+    GPIO_PinData_t        *allocPinData = NULL;
+    GPIO_MonitoringMode_t  monitoringMode;
+    unsigned long          irqFlags;
 
     if ( monitor->gpio < 0 || monitor->gpio >= NUM_GPIO_PINS)
     {
@@ -972,7 +1012,9 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
         return -EINVAL;
     }
     
-    if ( monitor->onOff )
+    monitoringMode = monitor->onOff;
+
+    if ( monitoringMode )
     {
         if (( allocPinData = kcalloc( 1, sizeof( *pinData ), GFP_KERNEL )) == NULL )
         {
@@ -983,7 +1025,7 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
 
     spin_lock_irqsave( &gPinListLock, flags );
 
-    if ( monitor->onOff )
+    if ( monitoringMode )
     {
         // Check to make sure we aren't already monitoring the gpio
 
@@ -1054,6 +1096,8 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
             gpio_free( monitor->gpio );
             goto out;
         }
+
+        pinData->monitoringMode   = monitoringMode;
 
         pinData->gpio             = monitor->gpio;
         pinData->edgeType         = monitor->edgeType;
