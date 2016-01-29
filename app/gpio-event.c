@@ -41,9 +41,13 @@
 int     gDebug      = 0;
 int     gVerbose    = 0;
 int     gBinary     = 0;
+int     gCount      = 0;
 int     gMonitor    = 0;
 char   *gExecuteStr = NULL;
 int     gSelect     = 0;
+
+int     gNumMonitoredPins = 0;
+int     gMonitoredPins[256];
 
 /* ---- Private Constants and Types -------------------------------------- */
 /* ---- Private Variables ------------------------------------------------ */
@@ -54,6 +58,7 @@ enum
     // as a short option.
 
     OPT_BINARY      = 'b',
+    OPT_COUNT       = 'c',
     OPT_DEBUG       = 'd',
     OPT_EXECUTE     = 'e',
     OPT_MONITOR     = 'm',
@@ -71,6 +76,7 @@ enum
 struct option gOption[] =
 {
     { "binary",     no_argument,        NULL,       OPT_BINARY },
+    { "count",      no_argument,        NULL,       OPT_COUNT },
     { "execute",    required_argument,  NULL,       OPT_EXECUTE },
     { "monitor",    no_argument,        NULL,       OPT_MONITOR },
     { "select",     no_argument,        NULL,       OPT_SELECT },
@@ -95,6 +101,7 @@ static void Usage( void )
     fprintf( stderr, "Usage: gpio-event [options] gpio[:edge[:debounce]] ...\n" );
     fprintf( stderr, "  where edge can be rising, falling, both, or r, f, b\n" );
     fprintf( stderr, "  -b, --binary        Use the binary interface\n" );
+    fprintf( stderr, "  -c, --count         Count the gpio events\n" );
     fprintf( stderr, "  -e, --execute CMD   Execute the given program\n" );
     fprintf( stderr, "  -m, --monitor       Monitor the gpio events\n" );
     fprintf( stderr, "  -s, --select        Wait for event using select\n" );
@@ -103,6 +110,35 @@ static void Usage( void )
     fprintf( stderr, "  -h, --help          Prints this information\n" );
 
 } // Usage
+
+/****************************************************************************
+*
+*  getNumEvents
+*
+***************************************************************************/
+
+static int getNumEvents( int gpio )
+{
+    char fname[4096];
+    FILE* f;
+    int result = 0;
+
+    snprintf(fname, 4096, "/sys/devices/virtual/gpio-event/gpio-event/counters/gpio%d", gpio);
+    
+    f = fopen(fname, "r");
+    if (f != NULL) {
+	fscanf(f, "%d", &result);
+        fclose(f);
+    }
+    
+    f = fopen(fname, "w");
+    if (f != NULL) {
+        fputs("0", f);
+        fclose(f);
+    }
+
+    return result;
+}
 
 /****************************************************************************
 *
@@ -151,6 +187,12 @@ int main( int argc, char **argv )
             case OPT_BINARY:
             {
                 gBinary = 1;
+                break;
+            }
+
+            case OPT_COUNT:
+            {
+                gCount = 1;
                 break;
             }
 
@@ -219,6 +261,7 @@ int main( int argc, char **argv )
     // Parse the gpio pins. Each pin can be followed by a modifier to indicate
     // the type of edges to monitor.
 
+    gNumMonitoredPins = 0;
     for ( arg = 0; arg < argc; arg++ ) 
     {
         long                    gpio;
@@ -289,9 +332,19 @@ int main( int argc, char **argv )
         {
             perror( "ioctl GPIO_EVENT_IOCTL_MONITOR_GPIO failed" );
         }
+
+        gMonitoredPins[gNumMonitoredPins++] = monitor.gpio;
     }
 
-    if ( gMonitor || ( gExecuteStr != NULL ))
+    // gCount implies gSelect because we need to print the counters periodically
+    gSelect = gSelect || gCount;
+
+    if ( gCount )
+    {
+        // TODO: turn on monitoring
+    }
+ 
+    if ( gMonitor || gCount || ( gExecuteStr != NULL ))
     {
         while ( 1 )
         {
@@ -306,7 +359,7 @@ int main( int argc, char **argv )
                 struct  timeval tv;
                 int     rc;
 
-                printf( "Waiting for data " );
+                printf( "Waiting for data %s", gCount ? "...\n" : "" );
                 fflush( stdout );
 
                 while ( 1 )
@@ -332,11 +385,26 @@ int main( int argc, char **argv )
                     }
                     else
                     {
-                        printf( "." );
-                        fflush( stdout );
+                        if ( gCount )
+                        {
+                            for ( arg = 0; arg < gNumMonitoredPins; arg++ )
+                            {
+                                printf( "GPIO pin #%d: %d events\n", gMonitoredPins[arg],
+                                        getNumEvents(gMonitoredPins[arg]) );
+                            }
+                        }
+                        else
+                        {
+                            printf( "." );
+                            fflush( stdout );
+                        }
                     }
                 }
-                printf( "\n" );
+
+                if ( !gCount )
+                {
+                    printf( "\n" );
+                }
             }
 
             if ( gBinary )
