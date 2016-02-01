@@ -134,6 +134,12 @@ static struct ctl_table gSysCtl[] =
 
 #define GPIO_EVENT_BUFFER_SIZE  32
 
+/*
+ * Maximum number of pins supported by this driver
+ */
+
+#define NUM_GPIO_PINS 256
+
 typedef struct
 {
     struct list_head        list;
@@ -178,17 +184,46 @@ typedef struct
     uint8_t                 debounceMilliSec;   // debounce time in milliseconds
     char                    devName[ 16 ];      // gpio xx event
 
-    GPIO_EventEdgeType_t    edgeType;   // Type of edge(s) we're looking for.
+    GPIO_EventEdgeType_t    edgeType;           // Type of edge(s) we're looking for.
 
-    PinState_t              pinState;          // Was the GPIO line low or high?
+    PinState_t              pinState;           // Was the GPIO line low or high?
+
+    GPIO_MonitoringMode_t   monitoringMode;     // Whether to count or generate events (or both)
 
 } GPIO_PinData_t;
+
+/*
+ * Typedef for a linked list of kobject attributes corresponding to the
+ * GPIO event counters
+ */
+
+typedef struct
+{
+    struct list_head list;                      // list of all counter attributes
+    
+    int              gpio;                      // The gpio line that this attribute refers to
+    struct kobj_attribute kattr;                // kobject attribute for the counter
+} GPIO_CounterAttrData_t;
+
+/*
+ * An instance of GPIO_Counters_t is present globally within the driver to
+ * keep track of the number of events seen for GPIO pints
+ */
+
+typedef struct
+{
+    struct kobject        *kobj;               // kobject representation
+    uint32_t               counters[ NUM_GPIO_PINS ];  // event counters
+    GPIO_CounterAttrData_t attributes;         // list of all counter attributes
+} GPIO_Counters_t;
 
 static  volatile    int     gReportLostEvents = 1;
 
 static  struct class       *gGpioEventClass = NULL;
 static  struct  cdev        gGpioEventCDev;
 static  dev_t               gGpioEventDevNum = 0;
+static  struct device      *gGpioEventDevice = NULL;
+static  GPIO_Counters_t     gGpioEventCounters;
 
 static  DEFINE_SPINLOCK( gFileListLock );
 static  DEFINE_SPINLOCK( gPinListLock );
@@ -269,6 +304,7 @@ static int pin_seq_show( struct seq_file *s, void *v )
 {
     GPIO_PinData_t *pin = list_entry( v, GPIO_PinData_t, list );
     char           *edgeTypeStr;
+    char           *modeStr;
 
     DEBUG( Trace, "v = 0x%08lx\n", (long)v );
 
@@ -280,7 +316,31 @@ static int pin_seq_show( struct seq_file *s, void *v )
         default:                    edgeTypeStr = "Unknown";    break;
     }
 
-    seq_printf( s, "GPIO: %3d Edge: %s Debounce: %d msec\n", pin->gpio, edgeTypeStr, pin->debounceMilliSec );
+    if ( pin->monitoringMode & GPIO_GenerateEvents )
+    {
+        if ( pin->monitoringMode & GPIO_UpdateCounters )
+        {
+            modeStr = "Count and generate events";
+        }
+        else
+        {
+            modeStr = "Generate events";
+        }
+    }
+    else
+    {
+        if ( pin->monitoringMode & GPIO_UpdateCounters )
+        {
+            modeStr = "Count events";
+        }
+        else
+        {
+            modeStr = "Off";
+        }
+    }
+
+    seq_printf( s, "GPIO: %3d Edge: %s Debounce: %d msec Mode: %s\n",
+        pin->gpio, edgeTypeStr, pin->debounceMilliSec, modeStr );
 
     return 0;
 
@@ -417,6 +477,266 @@ static GPIO_PinData_t *find_pin( int gpio )
 
 /****************************************************************************
 *
+*  gpio_event_counter_get
+*
+*  Returns the value of a single GPIO event counter.
+*
+****************************************************************************/
+
+static uint32_t gpio_event_counter_get( int gpio )
+{
+    return gGpioEventCounters.counters[gpio];
+
+} // gpio_event_counter_get
+
+/****************************************************************************
+*
+*  gpio_event_counter_increase
+*
+*  Increases the value of a single GPIO event counter.
+*
+****************************************************************************/
+
+static void gpio_event_counter_increase( int gpio, uint32_t by )
+{
+    gGpioEventCounters.counters[gpio] += by;
+
+} // gpio_event_counter_increase
+
+/****************************************************************************
+*
+*  gpio_event_counter_set
+*
+*  Sets the value of a single GPIO event counter.
+*
+****************************************************************************/
+
+static void gpio_event_counter_set( int gpio, uint32_t value )
+{
+    gGpioEventCounters.counters[gpio] = value;
+
+} // gpio_event_counter_set
+
+/****************************************************************************
+*
+*  gpio_event_counter_attribute_show
+*
+*  Shows the value of a GPIO event attribute when invoked via the 'show'
+*  handler function of its kobject.
+*
+****************************************************************************/
+
+static ssize_t gpio_event_counter_attribute_show(
+    struct kobject *kobj, struct kobj_attribute *attr, char *buf )
+{
+    const GPIO_CounterAttrData_t* counter_data =
+        container_of(attr, GPIO_CounterAttrData_t, kattr);
+
+    return scnprintf(buf, PAGE_SIZE, "%u\n", gpio_event_counter_get(counter_data->gpio));
+
+} // gpio_event_counter_attribute_show
+
+/****************************************************************************
+*
+*  gpio_event_counter_attribute_store
+*
+*  Stores a new value for a GPIO event attribute when invoked via the 'store'
+*  handler function of its kobject.
+*
+****************************************************************************/
+
+static ssize_t gpio_event_counter_attribute_store(
+    struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count )
+{
+    const GPIO_CounterAttrData_t* counter_data =
+        container_of(attr, GPIO_CounterAttrData_t, kattr);
+    unsigned int new_value = 0;
+
+    // Read the value into an unsigned int first; we will cast implicitly later
+    if (sscanf(buf, "%u", &new_value) != 0)
+    {
+        gpio_event_counter_set(counter_data->gpio, new_value);
+    }
+
+    return count;
+
+} // gpio_event_counter_attribute_store
+
+/****************************************************************************
+*
+*  gpio_event_counters_reset
+*
+*  Resets all the GPIO event counters to zeros.
+*
+****************************************************************************/
+
+static void gpio_event_counters_reset( GPIO_Counters_t* counters )
+{
+    memset(counters->counters, 0, sizeof(counters->counters));
+
+} // gpio_event_counters_reset
+
+/****************************************************************************
+*
+*  gpio_event_counters_add_attribute
+*
+*  Adds a kobject attribute for the counter with the given index.
+*
+****************************************************************************/
+
+static int gpio_event_counters_add_attribute( GPIO_Counters_t* counters, int gpio )
+{
+   GPIO_CounterAttrData_t *attr_data;
+   char *name;
+   int rc;
+
+   // Allocate space for the attribute data structure
+   
+   attr_data = (GPIO_CounterAttrData_t *) kcalloc( 1, sizeof(GPIO_CounterAttrData_t), GFP_KERNEL );
+
+   if (attr_data == 0)
+   {
+       return -ENOMEM;
+   }
+
+   // Allocate space for the name of the attribute
+   
+   name = (char *) kcalloc( 8, sizeof(char), GFP_KERNEL );
+
+   if (name == 0)
+   {
+       kfree( attr_data );
+       return -ENOMEM;
+   }
+
+   // Prepare the attribute
+   
+   snprintf( name, 8, "gpio%d", gpio ); 
+   attr_data->gpio = gpio;
+   attr_data->kattr.attr.name = name;
+   attr_data->kattr.attr.mode = S_IRUGO | S_IWUSR;
+   attr_data->kattr.show = gpio_event_counter_attribute_show;
+   attr_data->kattr.store = gpio_event_counter_attribute_store;
+
+   // Add the attribute to sysfs
+
+   if (( rc = sysfs_create_file( counters->kobj, &attr_data->kattr.attr )) != 0 )
+   {
+       // Free the attribute
+       kfree( name );
+       kfree( attr_data );
+       return rc;
+   }
+   
+   // Link the attribute into the linked list
+    
+   list_add_tail( &attr_data->list, &counters->attributes.list );
+   
+   return 0; 
+
+} // gpio_event_counters_add_attribute
+
+/****************************************************************************
+*
+*  gpio_event_counters_remove_attribute
+*
+*  Removes the kobject attribute for the counter with the given index.
+*
+****************************************************************************/
+
+static void gpio_event_counters_remove_attribute( GPIO_Counters_t* counters, int gpio )
+{
+    struct list_head *pos, *dummy;
+    GPIO_CounterAttrData_t *attr_data;
+
+    list_for_each_safe(pos, dummy, &counters->attributes.list)
+    {
+        attr_data = list_entry(pos, GPIO_CounterAttrData_t, list);
+
+        if (attr_data == 0 || attr_data->gpio != gpio)
+        {
+            continue;
+        }
+
+        // Remove the attribute from sysfs
+
+        sysfs_remove_file( counters->kobj, &attr_data->kattr.attr );
+        
+	// Free the memory we have allocated for the name
+
+        if (attr_data->kattr.attr.name != 0)
+        {
+            kfree(attr_data->kattr.attr.name);
+        }
+
+	// Unlink the item from the list and free it
+
+        list_del(pos);
+        kfree(attr_data);
+
+        // Bail out from the loop.
+        break;
+
+    }
+     
+} // gpio_event_counters_add_attribute
+
+/****************************************************************************
+*
+*  gpio_event_counters_init
+*
+*  Initializes the global GPIO event counters structure.
+*
+****************************************************************************/
+
+static int gpio_event_counters_init( GPIO_Counters_t* counters, struct kobject *parent,
+                                     const char* name )
+{
+    // Reset the GPIO event counters to zeros
+
+    gpio_event_counters_reset( counters );
+
+    // Clear the list of kobject attributes
+
+    INIT_LIST_HEAD( &counters->attributes.list );
+    
+    // Create a new kobject that will hold the attributes for the counters.
+
+    counters->kobj = kobject_create_and_add(name, parent);
+    if ( IS_ERR( counters->kobj ))
+    {
+        return -1;
+    }
+
+    return 0;
+    
+} // gpio_event_counters_init
+
+/****************************************************************************
+*
+*  gpio_event_counters_destroy
+*
+*  Destroys the global GPIO event counters structure.
+*
+****************************************************************************/
+
+static void gpio_event_counters_destroy( GPIO_Counters_t* counters )
+{
+    struct list_head *pos, *dummy;
+    GPIO_CounterAttrData_t *attr_data;
+
+    list_for_each_safe(pos, dummy, &counters->attributes.list)
+    {
+        attr_data = list_entry(pos, GPIO_CounterAttrData_t, list);
+        gpio_event_counters_remove_attribute( counters, attr_data->gpio );
+    }
+
+    kobject_put( counters->kobj );
+     
+} // gpio_event_counters_destroy
+
+/****************************************************************************
+*
 *  gpio_event_queue_event
 *
 *   Queues an sample event from the bottom half to the top half. This
@@ -540,7 +860,17 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
 
     (void)irq;
 
-    do_gettimeofday( &gpioEvent.time );
+    if ( pinData->monitoringMode & GPIO_GenerateEvents )
+    { 
+        // Query the current time and store it in the event
+        do_gettimeofday( &gpioEvent.time );
+    }
+    else
+    {
+        // We don't need the current time -- we won't use gpioEvent anyway
+        gpioEvent.time = 0;
+    }
+    
     gpioEvent.gpio = pinData->gpio;
 
     if ( pinData->debounceMilliSec == 0 )
@@ -574,7 +904,18 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
 
             gpioEvent.edgeType = pinData->edgeType;
         }
-        gpio_event_queue_event( &gpioEvent );
+
+        // Send the event to the user
+        if ( pinData->monitoringMode & GPIO_GenerateEvents )
+        { 
+            gpio_event_queue_event( &gpioEvent );
+        }
+
+        // Also increase the event counter
+        if ( pinData->monitoringMode & GPIO_UpdateCounters )
+        {
+            gpio_event_counter_increase( pinData->gpio, 1 ); 
+        }
     }
     else
     {
@@ -610,8 +951,16 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
         if (( pinData->edgeType & gpioEvent.edgeType ) != 0 )
         {
             // This is an edge that the user is interested in - send it along.
+            if ( pinData->monitoringMode & GPIO_GenerateEvents )
+            {
+                gpio_event_queue_event( &gpioEvent );
+            }
 
-            gpio_event_queue_event( &gpioEvent );
+            // Also increase the event counter
+            if ( pinData->monitoringMode & GPIO_UpdateCounters )
+            {
+                gpio_event_counter_increase( pinData->gpio, 1 ); 
+            }
         }
 
         // Disable interrupts for our gpio to allow debounce to occur. The
@@ -660,13 +1009,22 @@ void gpio_event_timer( unsigned long data )
 
 static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
 {
-    int             rc = 0;
-    unsigned long   flags;
-    GPIO_PinData_t *pinData;
-    GPIO_PinData_t *allocPinData = NULL;
-    unsigned long   irqFlags;
+    int                    rc = 0;
+    unsigned long          flags;
+    GPIO_PinData_t        *pinData;
+    GPIO_PinData_t        *allocPinData = NULL;
+    GPIO_MonitoringMode_t  monitoringMode;
+    unsigned long          irqFlags;
 
-    if ( monitor->onOff )
+    if ( monitor->gpio < 0 || monitor->gpio >= NUM_GPIO_PINS)
+    {
+        DEBUG( Error, "Attempted to monitor invalid GPIO pin: %d\n", monitor->gpio );
+        return -EINVAL;
+    }
+    
+    monitoringMode = monitor->onOff;
+
+    if ( monitoringMode )
     {
         if (( allocPinData = kcalloc( 1, sizeof( *pinData ), GFP_KERNEL )) == NULL )
         {
@@ -677,7 +1035,7 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
 
     spin_lock_irqsave( &gPinListLock, flags );
 
-    if ( monitor->onOff )
+    if ( monitoringMode )
     {
         // Check to make sure we aren't already monitoring the gpio
 
@@ -740,6 +1098,17 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
             goto out;
         }
 
+        // create an appropriate counter entry for the pin in sysfs
+        if (( rc = gpio_event_counters_add_attribute( &gGpioEventCounters, monitor->gpio )) != 0)
+        {
+            DEBUG( Error, "Unable to add counter attribute for GPIO %d, %d\n", monitor->gpio, rc );
+            free_irq( gpio_to_irq( monitor->gpio ), pinData );
+            gpio_free( monitor->gpio );
+            goto out;
+        }
+
+        pinData->monitoringMode   = monitoringMode;
+
         pinData->gpio             = monitor->gpio;
         pinData->edgeType         = monitor->edgeType;
         pinData->debounceMilliSec = monitor->debounceMilliSec;
@@ -772,6 +1141,7 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
 
         // We've found the gpio being monitored - turn things off.
 
+        gpio_event_counters_remove_attribute( &gGpioEventCounters, monitor->gpio );
         free_irq( gpio_to_irq( pinData->gpio ), pinData );
 
         del_timer_sync( &pinData->debounceTimer );
@@ -1112,7 +1482,7 @@ static int __init gpio_event_init( void )
 
     if (( rc = alloc_chrdev_region( &gGpioEventDevNum, 0, 1, GPIO_EVENT_DEV_NAME )) < 0 )
     {
-        printk( KERN_WARNING "sample: Unable to allocate major, err: %d\n", rc );
+        printk( KERN_WARNING "gpio-event-drv: Unable to allocate major, err: %d\n", rc );
         return rc;
     }
     DEBUG( Trace, "allocated major:%d minor:%d\n", MAJOR( gGpioEventDevNum ), MINOR( gGpioEventDevNum ));
@@ -1148,7 +1518,7 @@ static int __init gpio_event_init( void )
 
     if (( rc = cdev_add( &gGpioEventCDev, gGpioEventDevNum, 1 )) != 0 )
     {
-        printk( KERN_WARNING "sample: cdev_add failed: %d\n", rc );
+        printk( KERN_WARNING "gpio-event-drv: cdev_add failed: %d\n", rc );
         return rc;
     }
 
@@ -1157,11 +1527,24 @@ static int __init gpio_event_init( void )
     gGpioEventClass = class_create( THIS_MODULE, GPIO_EVENT_DEV_NAME );
     if ( IS_ERR( gGpioEventClass ))
     {
-        printk( KERN_WARNING "sample: Unable to create class\n" );
+        printk( KERN_WARNING "gpio-event-drv: Unable to create class\n" );
         return -1;
     }
 
-    device_create( gGpioEventClass, NULL, gGpioEventDevNum, NULL, GPIO_EVENT_DEV_NAME );
+    gGpioEventDevice = device_create( gGpioEventClass, NULL, gGpioEventDevNum, NULL, GPIO_EVENT_DEV_NAME );
+    if ( IS_ERR( gGpioEventDevice ))
+    {
+        printk( KERN_WARNING "gpio-event-drv: Unable to create device\n" );
+        return -1;
+    }
+
+    // Initialize the GPIO event counters object
+
+    if (( rc = gpio_event_counters_init( &gGpioEventCounters, &gGpioEventDevice->kobj, "counters" )) != 0)
+    {
+        printk( KERN_WARNING "gpio-event-drv: Unable to create counters kobject\n" );
+        return -1;
+    }
 
     return 0;
 
@@ -1199,8 +1582,10 @@ static void __exit gpio_event_exit( void )
 
     // Deregister our driver
 
+    gpio_event_counters_destroy( &gGpioEventCounters );
     device_destroy( gGpioEventClass, gGpioEventDevNum );
     class_destroy( gGpioEventClass );
+    gGpioEventDevice = NULL;
 
     cdev_del( &gGpioEventCDev );
 

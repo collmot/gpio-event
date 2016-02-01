@@ -72,7 +72,7 @@ typedef enum
 typedef struct
 {
     uint8_t                 gpio;               // gpio to monitor
-    uint8_t                 onOff;              // 0 = stop monitoring, 1 = start monitoring
+    uint8_t                 onOff;              // see GPIO_MonitoringMode_t
     GPIO_EventEdgeType_t    edgeType;           // Monitor rising/falling/both edges?
     uint8_t                 debounceMilliSec;   // debounce time in milliseconds
 
@@ -84,6 +84,15 @@ typedef enum
     GPIO_EventReadModeBinary    = 0x01,     // Reads return Binary data
 
 } GPIO_EventReadMode_t;
+
+typedef enum
+{
+    GPIO_MonitoringOff          = 0x00,     // Turn monitoring completely off
+    GPIO_GenerateEvents         = 0x01,     // Generate GPIO events on /dev/gpio-event
+    GPIO_UpdateCounters         = 0x02,     // Count GPIO edges in sysfs
+    GPIO_GenerateEventsAndUpdateCounters =
+        GPIO_GenerateEvents | GPIO_UpdateCounters
+} GPIO_MonitoringMode_t;
 
 /*
  * Definitions for the actual ioctl commands
