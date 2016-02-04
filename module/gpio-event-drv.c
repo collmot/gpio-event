@@ -868,7 +868,8 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
     else
     {
         // We don't need the current time -- we won't use gpioEvent anyway
-        gpioEvent.time = 0;
+        gpioEvent.time.tv_sec = 0;
+        gpioEvent.time.tv_usec = 0;
     }
     
     gpioEvent.gpio = pinData->gpio;
