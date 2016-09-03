@@ -1241,7 +1241,7 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
 
 #if defined(CONFIG_MACH_MESON8B_ODROIDC)
             DEBUG( Error, "Debouncing is not supported on AmLogic Meson.\n" );
-            return -EINVAL;
+            rc = -EINVAL;
             goto out;
 #endif
 
