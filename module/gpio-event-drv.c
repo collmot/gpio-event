@@ -43,6 +43,11 @@
 
 #include <linux/gpio.h>
 
+#if defined(CONFIG_MACH_MESON8B_ODROIDC)
+#   include <linux/amlogic/aml_gpio_consumer.h>
+#   define AMLGPIO_IRQ_BASE 96
+#endif
+
 #include "gpio-event-drv.h"
 
 /* ---- Public Variables ------------------------------------------------- */
@@ -846,11 +851,94 @@ static int gpio_event_dequeue_event( GPIO_FileData_t *fileData, GPIO_Event_t *gp
 
 /****************************************************************************
 *
-*  gpio_event_irq
+*  gpio_event_irq and related functions
 *
 ****************************************************************************/
 
-static irqreturn_t gpio_event_irq( int irq, void *dev_id )
+static inline void fill_gpio_and_timestamp_in_event( GPIO_Event_t *gpioEvent, GPIO_PinData_t *pinData )
+{
+    if ( pinData->monitoringMode & GPIO_GenerateEvents )
+    { 
+        // Query the current time and store it in the event
+        do_gettimeofday( &gpioEvent->time );
+    }
+    else
+    {
+        // We don't need the current time -- we won't use gpioEvent anyway
+        gpioEvent->time.tv_sec = 0;
+        gpioEvent->time.tv_usec = 0;
+    }
+    
+    gpioEvent->gpio = pinData->gpio;
+
+}
+
+static inline void send_event_and_update_counter( GPIO_Event_t *event, GPIO_PinData_t *pinData )
+{
+    // Send the event to the user
+    if ( pinData->monitoringMode & GPIO_GenerateEvents )
+    { 
+        gpio_event_queue_event( event );
+    }
+
+    // Also increase the event counter
+    if ( pinData->monitoringMode & GPIO_UpdateCounters )
+    {
+        gpio_event_counter_increase( pinData->gpio, 1 ); 
+    }
+
+}
+
+#if defined(CONFIG_MACH_MESON8B_ODROIDC)
+
+static irqreturn_t gpio_event_irq_rising( int irq, void *dev_id )
+{
+    GPIO_PinData_t         *pinData = (GPIO_PinData_t *)dev_id;
+    GPIO_Event_t            gpioEvent;
+
+    // We're called with interrupts disabled.
+
+    (void)irq;
+
+    fill_gpio_and_timestamp_in_event( &gpioEvent, pinData );
+
+    // This IRQ handler is called only on ODroidC where we don't support
+    // debouncing yet.
+
+    pinData->pinState = PIN_HIGH;
+    gpioEvent.edgeType = GPIO_EventRisingEdge;
+
+    send_event_and_update_counter( &gpioEvent, pinData );
+
+    return IRQ_HANDLED;
+
+} // gpio_event_irq_rising
+
+static irqreturn_t gpio_event_irq_falling( int irq, void *dev_id )
+{
+    GPIO_PinData_t         *pinData = (GPIO_PinData_t *)dev_id;
+    GPIO_Event_t            gpioEvent;
+
+    // We're called with interrupts disabled.
+
+    (void)irq;
+
+    fill_gpio_and_timestamp_in_event( &gpioEvent, pinData );
+
+    // This IRQ handler is called only on ODroidC where we don't support
+    // debouncing yet.
+
+    pinData->pinState = PIN_LOW;
+    gpioEvent.edgeType = GPIO_EventFallingEdge;
+
+    send_event_and_update_counter( &gpioEvent, pinData );
+
+    return IRQ_HANDLED;
+
+} // gpio_event_irq_falling
+
+#else
+static irqreturn_t gpio_event_irq_rising_or_falling( int irq, void *dev_id )
 {
     GPIO_PinData_t         *pinData = (GPIO_PinData_t *)dev_id;
     GPIO_Event_t            gpioEvent;
@@ -860,19 +948,7 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
 
     (void)irq;
 
-    if ( pinData->monitoringMode & GPIO_GenerateEvents )
-    { 
-        // Query the current time and store it in the event
-        do_gettimeofday( &gpioEvent.time );
-    }
-    else
-    {
-        // We don't need the current time -- we won't use gpioEvent anyway
-        gpioEvent.time.tv_sec = 0;
-        gpioEvent.time.tv_usec = 0;
-    }
-    
-    gpioEvent.gpio = pinData->gpio;
+    fill_gpio_and_timestamp_in_event( &gpioEvent, pinData );
 
     if ( pinData->debounceMilliSec == 0 )
     {
@@ -906,17 +982,7 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
             gpioEvent.edgeType = pinData->edgeType;
         }
 
-        // Send the event to the user
-        if ( pinData->monitoringMode & GPIO_GenerateEvents )
-        { 
-            gpio_event_queue_event( &gpioEvent );
-        }
-
-        // Also increase the event counter
-        if ( pinData->monitoringMode & GPIO_UpdateCounters )
-        {
-            gpio_event_counter_increase( pinData->gpio, 1 ); 
-        }
+        send_event_and_update_counter( &gpioEvent, pinData );
     }
     else
     {
@@ -952,16 +1018,7 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
         if (( pinData->edgeType & gpioEvent.edgeType ) != 0 )
         {
             // This is an edge that the user is interested in - send it along.
-            if ( pinData->monitoringMode & GPIO_GenerateEvents )
-            {
-                gpio_event_queue_event( &gpioEvent );
-            }
-
-            // Also increase the event counter
-            if ( pinData->monitoringMode & GPIO_UpdateCounters )
-            {
-                gpio_event_counter_increase( pinData->gpio, 1 ); 
-            }
+            send_event_and_update_counter( &gpioEvent, pinData );
         }
 
         // Disable interrupts for our gpio to allow debounce to occur. The
@@ -978,7 +1035,9 @@ static irqreturn_t gpio_event_irq( int irq, void *dev_id )
 
     return IRQ_HANDLED;
 
-} // gpio_event_irq
+} // gpio_event_irq_rising_or_falling
+
+#endif
 
 /****************************************************************************
 *
@@ -1001,6 +1060,109 @@ void gpio_event_timer( unsigned long data )
     enable_irq( gpio_to_irq( pinData->gpio ));
 
 } // gpio_event_timer
+
+/****************************************************************************
+*
+*  gpio_event_request_irq_banks
+*
+*  Requests the IRQ lines required to monitor the given edges of the given
+*  GPIO pin
+*
+****************************************************************************/
+
+static int gpio_event_request_irq_banks( int gpio, unsigned long flags,
+                                         const char *name, void *dev )
+{
+    int irq = gpio_to_irq( gpio );
+    int ret;
+
+#if defined(CONFIG_MACH_MESON8B_ODROIDC)
+    int irq_banks[2] = {0, };
+
+    // Do a board-specific call to obtain the IRQ line offsets
+    // There is a small hack here: the first argument of meson_setup_irq() is
+    // a struct gpio_chip* that is not used anywhere, so we pass NULL there
+    // because we cannot obtain a handle to the GPIO chip anyway.
+    
+    ret = meson_setup_irq( 0, irq, flags, irq_banks );
+    if (ret < 0)
+    {
+        DEBUG( Error, "meson_setup_irq() failed with error %d\n", ret );
+        return ret;
+    }
+
+    // Handle the IRQ line for the rising edge (if needed)
+    
+    if ( irq_banks[0] != -1 )
+    {
+        irq = irq_banks[0] + AMLGPIO_IRQ_BASE;
+        ret = request_irq( irq, gpio_event_irq_rising, IRQF_DISABLED, name, dev );
+        if ( ret < 0 )
+        {
+            return ret;
+        }
+    }
+
+    // Handle the IRQ line for the falling edge (if needed)
+    
+    if ( irq_banks[1] != -1 )
+    {
+        irq = irq_banks[1] + AMLGPIO_IRQ_BASE;
+        ret = request_irq( irq, gpio_event_irq_falling, IRQF_DISABLED, name, dev );
+        if ( ret < 0 )
+        {
+            if ( irq_banks[0] != -1 )
+            {
+                free_irq( irq_banks[0] + AMLGPIO_IRQ_BASE, dev );
+            }
+        }
+        return ret;
+    }
+
+    return 0;
+#else
+    return request_irq( irq, gpio_event_irq_rising_or_falling, flags, name, dev );
+#endif
+
+} // gpio_event_request_irq_banks
+
+/****************************************************************************
+*
+*  gpio_event_free_irq_banks
+*
+*  Releases the IRQ lines currently acquired for the given GPIO pin
+*
+****************************************************************************/
+
+static void gpio_event_free_irq_banks( int gpio, void *dev )
+{
+    int irq = gpio_to_irq( gpio );
+
+#if defined(CONFIG_MACH_MESON8B_ODROIDC)
+    int irq_banks[2] = {0, };
+
+    // Do a board-specific call to obtain the IRQ line offsets
+    
+    meson_free_irq( irq, irq_banks );
+
+    // Handle the IRQ line for the rising edge (if needed)
+    
+    if ( irq_banks[0] != -1 )
+    {
+        free_irq( irq_banks[0] + AMLGPIO_IRQ_BASE, dev );
+    }
+
+    // Handle the IRQ line for the falling edge (if needed)
+    
+    if ( irq_banks[1] != -1 )
+    {
+        free_irq( irq_banks[1] + AMLGPIO_IRQ_BASE, dev );
+    }
+#else
+    free_irq( irq, dev_id );
+#endif
+
+} // gpio_event_free_irq_banks
 
 /****************************************************************************
 *
@@ -1076,6 +1238,13 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
         }
         else
         {
+
+#if defined(CONFIG_MACH_MESON8B_ODROIDC)
+            DEBUG( Error, "Debouncing is not supported on AmLogic Meson.\n" );
+            return -EINVAL;
+            goto out;
+#endif
+
             // Since we need to debounce, we need to look for both types of
             // edges, since we get both types of edges whenever a bounce
             // happens.
@@ -1092,7 +1261,7 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
         }
 
         gpio_direction_input( monitor->gpio );
-        if (( rc = request_irq( gpio_to_irq( monitor->gpio ), gpio_event_irq, irqFlags, pinData->devName, pinData )) != 0 )
+        if (( rc = gpio_event_request_irq_banks( monitor->gpio, irqFlags, pinData->devName, pinData )) != 0 )
         {
             DEBUG( Error, "Unable to register irq for GPIO %d\n", monitor->gpio );
             gpio_free( monitor->gpio );
@@ -1103,7 +1272,7 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
         if (( rc = gpio_event_counters_add_attribute( &gGpioEventCounters, monitor->gpio )) != 0)
         {
             DEBUG( Error, "Unable to add counter attribute for GPIO %d, %d\n", monitor->gpio, rc );
-            free_irq( gpio_to_irq( monitor->gpio ), pinData );
+            gpio_event_free_irq_banks( monitor->gpio, pinData );
             gpio_free( monitor->gpio );
             goto out;
         }
@@ -1143,7 +1312,7 @@ static int gpio_event_monitor( GPIO_EventMonitor_t *monitor )
         // We've found the gpio being monitored - turn things off.
 
         gpio_event_counters_remove_attribute( &gGpioEventCounters, monitor->gpio );
-        free_irq( gpio_to_irq( pinData->gpio ), pinData );
+        gpio_event_free_irq_banks( monitor->gpio, pinData );
 
         del_timer_sync( &pinData->debounceTimer );
         list_del( &pinData->list );
