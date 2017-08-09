@@ -1074,10 +1074,10 @@ static int gpio_event_request_irq_banks( int gpio, unsigned long flags,
                                          const char *name, void *dev )
 {
     int irq = gpio_to_irq( gpio );
-    int ret;
 
 #if defined(CONFIG_MACH_MESON8B_ODROIDC)
     int irq_banks[2] = {0, };
+    int ret;
 
     // Do a board-specific call to obtain the IRQ line offsets
     // There is a small hack here: the first argument of meson_setup_irq() is
@@ -1159,7 +1159,7 @@ static void gpio_event_free_irq_banks( int gpio, void *dev )
         free_irq( irq_banks[1] + AMLGPIO_IRQ_BASE, dev );
     }
 #else
-    free_irq( irq, dev_id );
+    free_irq( irq, dev );
 #endif
 
 } // gpio_event_free_irq_banks
